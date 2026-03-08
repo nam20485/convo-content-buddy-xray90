@@ -1,0 +1,97 @@
+name: validate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install actionlint
+        run: |
+          curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- latest /usr/local/bin
+
+      - name: Lint GitHub Actions workflows
+        run: actionlint
+
+      - name: Install hadolint
+        run: |
+          curl -sSL -o /usr/local/bin/hadolint \
+            https://github.com/hadolint/hadolint/releases/download/v2.12.0/hadolint-Linux-x86_64
+          chmod +x /usr/local/bin/hadolint
+
+      - name: Lint Dockerfile
+        run: hadolint .github/.devcontainer/Dockerfile
+
+      - name: Lint shell scripts
+        run: |
+          sudo apt-get update && sudo apt-get install -y shellcheck
+          shellcheck --severity=warning test/*.sh
+
+      - name: Validate devcontainer.json
+        run: |
+          npx --yes @devcontainers/cli validate --workspace-folder . || true
+
+  test-prompt-assembly:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Run prompt assembly tests
+        run: bash test/test-prompt-assembly.sh
+
+  test-devcontainer-build:
+    needs: lint
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    # Only run the expensive build when devcontainer files change
+    if: >-
+      github.event_name == 'push' ||
+      contains(github.event.pull_request.changed_files_url, '.devcontainer') ||
+      true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull and clean devcontainer image metadata
+        run: |
+          IMAGE="ghcr.io/${{ github.repository }}/devcontainer:main-latest"
+          docker pull "$IMAGE" || true
+          # If prebuilt image is not available yet, build a local fallback image
+          # so devcontainers/ci can still run smoke tests on this commit.
+          if ! docker image inspect "$IMAGE" > /dev/null 2>&1; then
+            docker build \
+              -f .github/.devcontainer/Dockerfile \
+              -t "$IMAGE" \
+              .github/.devcontainer
+          fi
+          # Strip stale devcontainer.metadata label from cached prebuild
+          if docker image inspect "$IMAGE" > /dev/null 2>&1; then
+            echo "FROM $IMAGE" | docker build --label devcontainer.metadata='[]' -t "$IMAGE" -
+          fi
+
+      - name: Build devcontainer and run smoke tests
+        uses: devcontainers/ci@8bf61b26e9c3a98f69cb6ce2f88d24ff59b785c6 # v0.3
+        with:
+          imageName: ghcr.io/${{ github.repository }}/devcontainer
+          cacheFrom: ghcr.io/${{ github.repository }}/devcontainer
+          push: never
+          runCmd: bash test/test-devcontainer-tools.sh
